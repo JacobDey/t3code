@@ -288,6 +288,17 @@ export function summarizeT3ToolCalls(
     case "secret-request":
       label = phrase("Asked for", "ask for", quantity(selected.length, "secret"));
       break;
+    case "user-request-create":
+      // A retry with the same clientRequestId returns the request it already filed.
+      label = phrase(
+        "Filed",
+        "file",
+        quantity(countEntities(entityIds("id")), "request for the user", "requests for the user"),
+      );
+      break;
+    case "user-request-status":
+      label = phrase("Checked", "check", quantity(countEntities(entityIds("id")), "user request"));
+      break;
     case "worktree-handoff":
       label = phrase(
         "Handed off to",

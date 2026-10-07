@@ -54,6 +54,35 @@ describe("summarizeT3ToolCalls", () => {
     ).toBe("Answered 2 pending question requests");
   });
 
+  it("counts filed user requests once per returned id, so idempotent retries do not double count", () => {
+    const filed = completed(
+      { kind: "decide", title: "Pick a database", clientRequestId: "client-1" },
+      { id: "ask-1", status: "pending", created: true },
+    );
+    const replayed = completed(
+      { kind: "decide", title: "Pick a database", clientRequestId: "client-1" },
+      { id: "ask-1", status: "pending", created: false },
+    );
+    expect(summarizeT3ToolCalls("user-request-create", [filed, replayed])).toEqual({
+      label: "Filed 1 request for the user",
+      failedCount: 0,
+    });
+    expect(
+      summarizeT3ToolCalls("user-request-create", [
+        completed({ kind: "do", title: "Sign the form" }, [
+          { type: "text", text: JSON.stringify({ _tag: "OrchestratorMcpFailure" }) },
+        ]),
+      ]),
+    ).toEqual({ label: "Tried to file 1 request for the user", failedCount: 1 });
+    expect(
+      summarizeT3ToolCalls("user-request-status", [
+        completed({ id: "ask-1", waitSeconds: 30 }, { id: "ask-1", status: "pending" }),
+        completed({ id: "ask-1" }, { id: "ask-1", status: "approved" }),
+        completed({ id: "ask-2" }, { id: "ask-2", status: "declined" }),
+      ]).label,
+    ).toBe("Checked 2 user requests");
+  });
+
   it("counts attachments in distinct messages and falls back when attachment counts are missing", () => {
     const first = completed(
       { threadId: "thread-1", attachments: [{ id: "one" }, { id: "two" }] },

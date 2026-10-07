@@ -74,6 +74,17 @@ describe("resolveT3McpToolPresentation", () => {
     });
   });
 
+  it("pretty prints user request inbox T3 MCP tool names", () => {
+    expect(resolveT3McpToolPresentation("mcp__t3-code__t3_user_request_create")).toEqual({
+      displayName: "Ask the user",
+      logo: "t3-code",
+    });
+    expect(resolveT3McpToolPresentation("t3-code.t3_user_request_status")).toEqual({
+      displayName: "Check a user request",
+      logo: "t3-code",
+    });
+  });
+
   it("matches the separator variants ACP registry agents emit", () => {
     for (const name of [
       "mcp_t3-code_delegate_task",
