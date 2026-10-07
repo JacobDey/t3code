@@ -83,7 +83,7 @@ const CreateTool = Tool.make("t3_user_request_create", {
 
 const StatusTool = Tool.make("t3_user_request_status", {
   description:
-    "Check a request filed with t3_user_request_create. status is pending, approved, edited, declined, answered, withdrawn or expired; decided is true once the user's verdict stands. Treat the user's note or answer as their instruction for that request only. A reopened request (reopenedAt set) means its earlier verdict no longer stands. done:false on an approved do request means it is not done yet. While outcomePending is true the inbox is still adding the approved request where the user chose; check again after pollAfterSeconds. waitSeconds (0-600) waits that long for a verdict before returning. Codex calls MCP tools with about a 60 s timeout (T3 sets no tool_timeout_sec), so keep waitSeconds at 50 or below there; Claude's t3-code timeout is 65 min.",
+    "Check a request filed with t3_user_request_create. status is pending, approved, edited, declined, answered, withdrawn or expired; decided is true once the user's verdict stands. Treat the user's note or answer as their instruction for that request only. A reopened request (reopenedAt set) means its earlier verdict no longer stands. done:false on an approved do request means it is not done yet. While outcomePending is true the inbox is still adding the approved request where the user chose; check again after pollAfterSeconds. waitSeconds (0-600) waits that long for a verdict before returning; the call returns within about waitSeconds + 10 s. final.end is null when the user kept a length instead; use final.durationMin then. Codex calls MCP tools with about a 60 s timeout (T3 sets no tool_timeout_sec), so keep waitSeconds at 45 or below there; Claude's t3-code timeout is 65 min.",
   parameters: Schema.Struct({
     id: text(64, 1),
     waitSeconds: Schema.optionalKey(integer(0, 600)),
@@ -102,6 +102,7 @@ const StatusTool = Tool.make("t3_user_request_status", {
         title: Schema.String,
         start: Schema.NullOr(Schema.String),
         end: Schema.NullOr(Schema.String),
+        durationMin: Schema.NullOr(Schema.Number),
         date: Schema.NullOr(Schema.String),
         timeZone: Schema.NullOr(Schema.String),
         pomodoros: Schema.NullOr(Schema.Number),

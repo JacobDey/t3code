@@ -78,8 +78,10 @@ that is not a plain `http(s)` URL is ignored.
 
 - **`t3_user_request_status`** reads a request by `id`. With `waitSeconds` (0–600),
   it keeps checking every 5 seconds while the request is still pending, and returns as
-  soon as a verdict arrives or the time runs out. Codex calls MCP tools with a timeout
-  of about 60 seconds, so agents there should keep `waitSeconds` at 50 or below.
+  soon as a verdict arrives or the time runs out. Each call returns within
+  `waitSeconds` plus 10 seconds, even when the inbox is slow. Codex calls MCP tools
+  with a timeout of about 60 seconds, so agents there should keep `waitSeconds` at 45
+  or below.
 
 Only a thread's own agent can file a request, and only while that thread has an
 active run. OAuth clients connected without a thread credential cannot use either
@@ -211,8 +213,8 @@ The response is the same request view that create returns. T3 Code needs `id` an
 }
 ```
 
-The agent sees `final.when` flattened into `final.start`, `end`, `date` and
-`timeZone`. A `url` that is not a plain `http(s)` URL is dropped.
+The agent sees `final.when` flattened into `final.start`, `end`, `durationMin`,
+`date` and `timeZone`. A `url` that is not a plain `http(s)` URL is dropped.
 
 **Statuses:**
 

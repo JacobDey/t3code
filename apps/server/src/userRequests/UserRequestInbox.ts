@@ -132,6 +132,7 @@ export interface UserRequestStatus {
     readonly title: string;
     readonly start: string | null;
     readonly end: string | null;
+    readonly durationMin: number | null;
     readonly date: string | null;
     readonly timeZone: string | null;
     readonly pomodoros: number | null;
@@ -168,6 +169,8 @@ const PROTOCOL = "user-request-inbox/1";
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const MAX_WAIT_SECONDS = 600;
 const POLL_INTERVAL = Duration.seconds(5);
+const ATTEMPT_TIMEOUT_MS = 10_000;
+const MAX_RETRY_AFTER_SECONDS = 86_400;
 const DEFAULT_DURATION_MIN = 50;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,}$/;
 const ERROR_CODE_PATTERN = /^[a-z-]{1,40}$/;
@@ -242,6 +245,7 @@ const toStatus = (body: Record<string, unknown>): UserRequestStatus => {
           title: stringOrNull(final.title) ?? "",
           start: stringOrNull(when.start),
           end: stringOrNull(when.end),
+          durationMin: numberOrNull(when.durationMin),
           date: stringOrNull(when.date),
           timeZone: stringOrNull(when.timeZone),
           pomodoros: numberOrNull(final.pomodoros),
@@ -324,11 +328,16 @@ const make = Effect.gen(function* () {
     };
   });
 
-  /** One request with transport policy and status mapping; returns the decoded 2xx body. */
+  /**
+   * One request with transport policy and status mapping; returns the decoded 2xx body.
+   * `deadline` (epoch millis) caps every attempt, the retry included, so a slow inbox
+   * cannot stretch a bounded wait past what the caller was promised.
+   */
   const send = (input: {
     readonly operation: "create" | "read";
     readonly request: HttpClientRequest.HttpClientRequest;
     readonly requestId?: string;
+    readonly deadline?: number;
   }) => {
     const { operation } = input;
     const unavailable = (
@@ -339,7 +348,7 @@ const make = Effect.gen(function* () {
         cause === undefined ? { operation, reason } : { operation, reason, cause },
       );
 
-    const attempt = Effect.gen(function* () {
+    const exchange = Effect.gen(function* () {
       const response = yield* httpClient.execute(input.request).pipe(
         Effect.mapError((error) =>
           // Keep only the underlying transport failure: the request carries the bearer header.
@@ -381,9 +390,19 @@ const make = Effect.gen(function* () {
     }).pipe(
       Effect.scoped,
       Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
-      Effect.timeout("10 seconds"),
-      Effect.catchTags({ TimeoutError: (error) => Effect.fail(unavailable("timeout", error)) }),
     );
+
+    const attempt = Effect.gen(function* () {
+      const budget =
+        input.deadline === undefined
+          ? ATTEMPT_TIMEOUT_MS
+          : Math.min(ATTEMPT_TIMEOUT_MS, input.deadline - (yield* Clock.currentTimeMillis));
+      if (budget <= 0) return yield* unavailable("timeout");
+      return yield* exchange.pipe(
+        Effect.timeout(Duration.millis(budget)),
+        Effect.catchTags({ TimeoutError: (error) => Effect.fail(unavailable("timeout", error)) }),
+      );
+    });
 
     return Effect.gen(function* () {
       // One retry on a network failure; the create carries the same Idempotency-Key both times.
@@ -403,8 +422,16 @@ const make = Effect.gen(function* () {
         const fromBody = numberOrNull(decoded?.retryAfterSec);
         const fromHeader = Number.parseInt(response.headers["retry-after"] ?? "", 10);
         const retryAfter = fromBody ?? (Number.isFinite(fromHeader) ? fromHeader : null);
+        // Clamped: an out-of-range value would fail the Int check and escape as a defect.
         return yield* new UserRequestInboxBusyError(
-          retryAfter === null ? {} : { retryAfterSeconds: Math.max(0, Math.floor(retryAfter)) },
+          retryAfter === null
+            ? {}
+            : {
+                retryAfterSeconds: Math.min(
+                  MAX_RETRY_AFTER_SECONDS,
+                  Math.max(0, Math.floor(retryAfter)),
+                ),
+              },
         );
       }
       if (operation === "read" && status === 404) {
@@ -539,9 +566,16 @@ const make = Effect.gen(function* () {
       );
       const waitSeconds = Math.max(0, Math.min(MAX_WAIT_SECONDS, Math.floor(input.waitSeconds)));
       const deadline = (yield* Clock.currentTimeMillis) + waitSeconds * 1000;
+      // The whole call, a slow final poll and its retry included, ends by waitSeconds + 10 s.
+      const hardDeadline = deadline + ATTEMPT_TIMEOUT_MS;
       for (;;) {
         const status = toStatus(
-          yield* send({ operation: "read", request, requestId: input.requestId }),
+          yield* send({
+            operation: "read",
+            request,
+            requestId: input.requestId,
+            deadline: hardDeadline,
+          }),
         );
         const remaining = deadline - (yield* Clock.currentTimeMillis);
         if (remaining <= 0 || (status.status !== "pending" && !status.outcomePending)) {

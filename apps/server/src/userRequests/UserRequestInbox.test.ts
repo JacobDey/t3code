@@ -2,13 +2,17 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ProjectId } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { expect, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as ConfigProvider from "effect/ConfigProvider";
+import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 import {
+  FetchHttpClient,
   HttpClient,
   HttpClientError,
   type HttpClientRequest,
@@ -57,13 +61,19 @@ const createInput = {
   },
 };
 
-type Reply = Response | "network-error";
+type Answer = Response | "network-error";
+/** "hang" never answers; `delay` answers only after that much (test clock) time. */
+type Reply = Answer | "hang" | { readonly delay: Duration.Input; readonly then: Answer };
 
 interface Captured {
   readonly method: string;
   readonly url: string;
   readonly headers: Readonly<Record<string, string>>;
   readonly body: string;
+  /** The `redirect` mode a real fetch client would apply to this request. */
+  readonly redirect: globalThis.RequestInit["redirect"];
+  /** Test-clock time the request went out. */
+  readonly at: number;
 }
 
 /** Runs `use` against the real service with a scripted inbox; the last reply repeats. */
@@ -73,22 +83,32 @@ const withInbox = <A, E>(
   use: (inbox: Inbox.UserRequestInbox["Service"]) => Effect.Effect<A, E>,
 ) => {
   const captured: Array<Captured> = [];
-  const http = HttpClient.make((request: HttpClientRequest.HttpClientRequest) => {
-    captured.push({
-      method: request.method,
-      url: request.url,
-      headers: request.headers,
-      body: request.body._tag === "Uint8Array" ? new TextDecoder().decode(request.body.body) : "",
-    });
-    const reply = (replies[captured.length - 1] ?? replies[replies.length - 1])!();
-    return reply === "network-error"
-      ? Effect.fail(
-          new HttpClientError.HttpClientError({
-            reason: new HttpClientError.TransportError({ request }),
-          }),
-        )
-      : Effect.succeed(HttpClientResponse.fromWeb(request, reply));
-  });
+  const http = HttpClient.make(
+    (request: HttpClientRequest.HttpClientRequest, _url, _signal, fiber) => {
+      captured.push({
+        method: request.method,
+        url: request.url,
+        headers: request.headers,
+        body: request.body._tag === "Uint8Array" ? new TextDecoder().decode(request.body.body) : "",
+        redirect: Context.getOrUndefined(fiber.context, FetchHttpClient.RequestInit)?.redirect,
+        at: fiber.getRef(Clock.Clock).currentTimeMillisUnsafe(),
+      });
+      const answer = (reply: Answer) =>
+        reply === "network-error"
+          ? Effect.fail(
+              new HttpClientError.HttpClientError({
+                reason: new HttpClientError.TransportError({ request }),
+              }),
+            )
+          : Effect.succeed(HttpClientResponse.fromWeb(request, reply));
+      const reply = (replies[captured.length - 1] ?? replies[replies.length - 1])!();
+      if (reply === "hang") return Effect.never;
+      if (typeof reply === "object" && "delay" in reply) {
+        return Effect.sleep(reply.delay).pipe(Effect.andThen(answer(reply.then)));
+      }
+      return answer(reply);
+    },
+  );
   return Effect.gen(function* () {
     const inbox = yield* Inbox.UserRequestInbox;
     const result = yield* use(inbox);
@@ -146,6 +166,20 @@ const agentView = (overrides: Record<string, unknown> = {}) => ({
   pollAfterSeconds: 120,
   ...overrides,
 });
+
+/**
+ * Runs `effect` while stepping the test clock a second at a time until it finishes. Each step
+ * also yields a real macrotask so the token-file read and response bodies (real I/O) keep up.
+ */
+const onTestClock = <A, E>(effect: Effect.Effect<A, E>) =>
+  Effect.gen(function* () {
+    const fiber = yield* effect.pipe(Effect.forkChild);
+    for (let second = 0; second < 900 && fiber.pollUnsafe() === undefined; second++) {
+      yield* TestClock.adjust("1 second");
+      yield* Effect.sleep("1 millis").pipe(TestClock.withLive);
+    }
+    return yield* Fiber.join(fiber);
+  });
 
 const failureOf = <A, E>(effect: Effect.Effect<A, E>) =>
   effect.pipe(
@@ -398,7 +432,53 @@ it.layer(NodeServices.layer)("UserRequestInbox", (it) => {
           );
           expect(result).toMatchObject(testCase.expected);
           expect(captured).toHaveLength(1);
+          // A real fetch client must hand the 3xx back instead of resending the bearer token.
+          expect(captured[0]?.redirect).toBe("manual");
         }
+      }),
+    ),
+  );
+
+  it.effect("clamps an absurd retry-after instead of failing as a defect", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const tokenFile = yield* makeTokenFile(TOKEN);
+        const cases = [
+          json({ error: "rate-limited", retryAfterSec: 1e20 }, 429),
+          () =>
+            new Response("slow down", {
+              status: 429,
+              headers: { "retry-after": "99999999999999999999" },
+            }),
+        ];
+        for (const reply of cases) {
+          const { result } = yield* withInbox(configured(tokenFile), [reply], (inbox) =>
+            failureOf(inbox.create(createInput)),
+          );
+          expect(result).toMatchObject({
+            _tag: "UserRequestInboxBusyError",
+            retryAfterSeconds: 86_400,
+          });
+        }
+      }),
+    ),
+  );
+
+  it.effect("gives up on an inbox that never answers", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const tokenFile = yield* makeTokenFile(TOKEN);
+        const { result, captured } = yield* withInbox(
+          configured(tokenFile),
+          [() => "hang" as const],
+          (inbox) => onTestClock(failureOf(inbox.create(createInput))),
+        );
+        expect(result).toMatchObject({
+          _tag: "UserRequestInboxUnavailableError",
+          reason: "timeout",
+        });
+        // A timeout is not retried: the inbox may still be working on the first attempt.
+        expect(captured).toHaveLength(1);
       }),
     ),
   );
@@ -418,6 +498,7 @@ it.layer(NodeServices.layer)("UserRequestInbox", (it) => {
             when: {
               start: "2026-10-08T15:00",
               end: "2026-10-08T16:00",
+              durationMin: 60,
               timeZone: "America/New_York",
             },
             pomodoros: 2,
@@ -445,6 +526,7 @@ it.layer(NodeServices.layer)("UserRequestInbox", (it) => {
             title: "Pair on the release",
             start: "2026-10-08T15:00",
             end: "2026-10-08T16:00",
+            durationMin: 60,
             date: null,
             timeZone: "America/New_York",
             pomodoros: 2,
@@ -467,11 +549,6 @@ it.layer(NodeServices.layer)("UserRequestInbox", (it) => {
     Effect.scoped(
       Effect.gen(function* () {
         const tokenFile = yield* makeTokenFile(TOKEN);
-        // Step the clock a second at a time so each poll runs before the next sleep starts.
-        const advance = Effect.gen(function* () {
-          for (let second = 0; second < 70; second++) yield* TestClock.adjust("1 second");
-        });
-
         const flips = yield* withInbox(
           configured(tokenFile),
           [
@@ -479,14 +556,7 @@ it.layer(NodeServices.layer)("UserRequestInbox", (it) => {
             json(agentView()),
             json(agentView({ status: "answered", decided: true, answer: "EU" })),
           ],
-          (inbox) =>
-            Effect.gen(function* () {
-              const fiber = yield* inbox
-                .read({ requestId: "0123456789", waitSeconds: 60 })
-                .pipe(Effect.forkChild);
-              yield* advance;
-              return yield* Fiber.join(fiber);
-            }),
+          (inbox) => onTestClock(inbox.read({ requestId: "0123456789", waitSeconds: 60 })),
         );
         expect(flips.result).toMatchObject({ status: "answered", answer: "EU" });
         expect(flips.captured).toHaveLength(3);
@@ -498,14 +568,7 @@ it.layer(NodeServices.layer)("UserRequestInbox", (it) => {
             json(agentView({ status: "approved", decided: true, outcomePending: true })),
             json(agentView({ status: "approved", decided: true, done: false })),
           ],
-          (inbox) =>
-            Effect.gen(function* () {
-              const fiber = yield* inbox
-                .read({ requestId: "0123456789", waitSeconds: 60 })
-                .pipe(Effect.forkChild);
-              yield* advance;
-              return yield* Fiber.join(fiber);
-            }),
+          (inbox) => onTestClock(inbox.read({ requestId: "0123456789", waitSeconds: 60 })),
         );
         expect(settling.result).toMatchObject({
           status: "approved",
@@ -515,17 +578,43 @@ it.layer(NodeServices.layer)("UserRequestInbox", (it) => {
         expect(settling.captured).toHaveLength(3);
 
         const budget = yield* withInbox(configured(tokenFile), [json(agentView())], (inbox) =>
-          Effect.gen(function* () {
-            const fiber = yield* inbox
-              .read({ requestId: "0123456789", waitSeconds: 14 })
-              .pipe(Effect.forkChild);
-            yield* advance;
-            return yield* Fiber.join(fiber);
-          }),
+          onTestClock(inbox.read({ requestId: "0123456789", waitSeconds: 14 })),
         );
         expect(budget.result.status).toBe("pending");
         // Polls at 0, 5 and 10 seconds, then once more when the 14 second budget runs out.
         expect(budget.captured).toHaveLength(4);
+
+        // A slow, failing final poll and its retry still finish by waitSeconds + 10 seconds.
+        const pending = json(agentView());
+        const overrun = yield* withInbox(
+          configured(tokenFile),
+          [
+            pending,
+            pending,
+            pending,
+            () => ({ delay: "9 seconds", then: "network-error" }),
+            () => "hang",
+          ],
+          (inbox) =>
+            onTestClock(
+              failureOf(inbox.read({ requestId: "0123456789", waitSeconds: 14 })).pipe(
+                Effect.andThen((error) =>
+                  Effect.map(Clock.currentTimeMillis, (at) => ({ error, at })),
+                ),
+              ),
+            ),
+        );
+        expect(overrun.result.error).toMatchObject({
+          _tag: "UserRequestInboxUnavailableError",
+          reason: "timeout",
+        });
+        // Polls at 0, 5, 10 and 14 seconds; the last fails at 23 and its retry gets the one
+        // second left. Unbounded, that retry would hang until 33 seconds.
+        const startedAt = overrun.captured[0]?.at ?? 0;
+        expect(overrun.captured.map((entry) => entry.at - startedAt)).toEqual([
+          0, 5_000, 10_000, 14_000, 23_000,
+        ]);
+        expect(overrun.result.at - startedAt).toBe(24_000);
       }),
     ),
   );

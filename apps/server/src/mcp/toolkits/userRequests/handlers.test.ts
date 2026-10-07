@@ -56,6 +56,7 @@ const status: UserRequestInbox.UserRequestStatus = {
     title: "Review the plan",
     start: "2026-10-08T14:00",
     end: "2026-10-08T15:00",
+    durationMin: null,
     date: null,
     timeZone: "America/New_York",
     pomodoros: 2,
